@@ -172,16 +172,17 @@ def setup_model_and_tokenizer(config: TrainingConfig):
 
 def tokenize_dataset(dataset: Dataset, tokenizer, max_length: int):
     """
-    Tokenize the dataset for training.
+    Tokenize the dataset for training with proper padding and truncation.
     """
     def tokenize_function(examples):
         # Use the formatted_chat column for training
         tokenized = tokenizer(
             examples["formatted_chat"],
             truncation=True,
-            padding=False,
+            padding="max_length",  # Pad all sequences to max_length
             max_length=max_length,
             return_tensors=None,
+            add_special_tokens=True,
         )
         
         # Set labels for causal language modeling
@@ -194,10 +195,62 @@ def tokenize_dataset(dataset: Dataset, tokenizer, max_length: int):
         tokenize_function,
         batched=True,
         remove_columns=dataset.column_names,
-        desc="Tokenizing"
+        desc="Tokenizing",
+        num_proc=1,  # Single process to avoid issues
     )
     
     return tokenized_dataset
+
+
+class DataCollatorForLanguageModeling:
+    """
+    Custom data collator to ensure proper padding and attention masks.
+    """
+    
+    def __init__(self, tokenizer, max_length=2048):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+    
+    def __call__(self, features):
+        # Extract input_ids and labels
+        batch = {}
+        
+        # Pad sequences to the same length
+        input_ids = [f["input_ids"] for f in features]
+        labels = [f["labels"] for f in features]
+        
+        # Pad to max length in batch or global max_length
+        max_len = min(max(len(seq) for seq in input_ids), self.max_length)
+        
+        # Pad input_ids
+        padded_input_ids = []
+        attention_masks = []
+        padded_labels = []
+        
+        for i, (inp, lab) in enumerate(zip(input_ids, labels)):
+            # Truncate if too long
+            if len(inp) > max_len:
+                inp = inp[:max_len]
+                lab = lab[:max_len]
+            
+            # Create attention mask (1 for real tokens, 0 for padding)
+            attention_mask = [1] * len(inp)
+            
+            # Pad sequences
+            padding_length = max_len - len(inp)
+            inp = inp + [self.tokenizer.pad_token_id] * padding_length
+            lab = lab + [-100] * padding_length  # -100 is ignored in loss
+            attention_mask = attention_mask + [0] * padding_length
+            
+            padded_input_ids.append(inp)
+            padded_labels.append(lab)
+            attention_masks.append(attention_mask)
+        
+        batch["input_ids"] = torch.tensor(padded_input_ids, dtype=torch.long)
+        batch["attention_mask"] = torch.tensor(attention_masks, dtype=torch.long)
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+        
+        return batch
 
 
 def setup_training_arguments(config: TrainingConfig, eval_config: EvalConfig):
@@ -312,6 +365,9 @@ def main():
     # Setup training arguments
     training_args = setup_training_arguments(config, eval_config)
     
+    # Create custom data collator
+    data_collator = DataCollatorForLanguageModeling(tokenizer, max_length=config.MAX_SEQ_LENGTH)
+    
     # Create trainer
     trainer = MedicalQATrainer(
         model=model,
@@ -319,6 +375,7 @@ def main():
         train_dataset=train_dataset_tokenized,
         eval_dataset=eval_dataset_tokenized,
         tokenizer=tokenizer,
+        data_collator=data_collator,  # Add the custom data collator
     )
     
     # Start training
